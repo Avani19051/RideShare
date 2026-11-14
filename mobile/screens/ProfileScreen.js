@@ -22,6 +22,8 @@ export default function ProfileScreen({ route, navigation }) {
   });
 
   const [connections, setConnections] = useState([]);
+  const [incoming, setIncoming] = useState([]);   // requests waiting for me
+  const [outgoing, setOutgoing] = useState([]);   // requests I sent
   const [loadingConn, setLoadingConn] = useState(false);
   const [loadingRides, setLoadingRides] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -45,7 +47,7 @@ export default function ProfileScreen({ route, navigation }) {
   useEffect(()=>{ (async()=>{
     if(!isFocused) return;
     await loadRides();
-    if(tabMain==="connections") await loadConnections();
+    await loadConnections();
   })(); }, [isFocused]);
 
   useEffect(()=>{ if(tabMain==="created" || tabMain==="joined") setTabSub("upcoming"); },[tabMain]);
@@ -75,8 +77,27 @@ export default function ProfileScreen({ route, navigation }) {
       setLoadingConn(true);
       const token = await getToken(); if(!token) return;
       const { resp, data } = await fetchJSON(`${apiBase}/connections/me`, { headers:{ Authorization:`Bearer ${token}` } });
-      if(resp.ok && data?.ok) setConnections(Array.isArray(data.connections)? data.connections: []);
+      if(resp.ok && data?.ok){
+        setConnections(Array.isArray(data.connections)? data.connections: []);
+        setIncoming(Array.isArray(data.incoming)? data.incoming: []);
+        setOutgoing(Array.isArray(data.outgoing)? data.outgoing: []);
+      }
     } finally { setLoadingConn(false); }
+  }
+
+  async function respondTo(from_uid, action){
+    try{
+      const token = await getToken(); if(!token) return Alert.alert("Login required");
+      const { resp, data } = await fetchJSON(`${apiBase}/connections/respond`, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", Authorization:`Bearer ${token}` },
+        body: JSON.stringify({ from_uid, action }),
+      });
+      if(!resp?.ok || !data?.ok) return Alert.alert("Failed", data?.error || `HTTP ${resp?.status||"?"}`);
+      await loadConnections();
+    } catch(e){
+      Alert.alert("Network error", e?.message || "Try again later");
+    }
   }
 
   async function onRefresh(){ setRefreshing(true); try{ tabMain==="connections" ? await loadConnections() : await loadRides(); } finally{ setRefreshing(false); } }
@@ -231,7 +252,7 @@ export default function ProfileScreen({ route, navigation }) {
           {[
             { key: "created", label: "CREATED", count: counts.created.total },
             { key: "joined", label: "JOINED", count: counts.joined.total },
-            { key: "connections", label: "CONNECTIONS", count: counts.connections },
+            { key: "connections", label: "CONNECTIONS", count: counts.connections, alert: incoming.length },
           ].map((t) => (
             <TouchableOpacity
               key={t.key}
@@ -245,6 +266,9 @@ export default function ProfileScreen({ route, navigation }) {
               <View style={styles.badge}>
                 <Text style={tabMain === t.key ? styles.badgeTextActive : styles.badgeText}>{t.count}</Text>
               </View>
+              {t.alert > 0 && (
+                <View style={styles.alertBadge}><Text style={styles.alertBadgeText}>{t.alert} new</Text></View>
+              )}
             </TouchableOpacity>
           ))}
         </View>
@@ -271,6 +295,28 @@ export default function ProfileScreen({ route, navigation }) {
               contentContainerStyle={{ paddingBottom: 16 }}
               refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
             >
+              {/* Requests waiting for my answer */}
+              {incoming.length > 0 && (
+                <View style={{ marginBottom: 14 }}>
+                  <Text style={styles.sectionTitle}>Connection Requests ({incoming.length})</Text>
+                  {incoming.map((u) => (
+                    <View key={`in-${u.uid}`} style={styles.connCard}>
+                      <Ionicons name="person-circle-outline" size={28} color="#7e57c2" />
+                      <View style={{ marginLeft: 10, flex: 1 }}>
+                        <Text style={{ fontWeight: "700", color: "#222" }}>{u.name || `User #${u.uid}`}</Text>
+                        <Text style={{ color: "#555" }}>wants to connect{u.year != null ? ` • Year ${u.year}` : ""}</Text>
+                      </View>
+                      <TouchableOpacity onPress={() => respondTo(u.uid, "accept")} style={[styles.reqBtn, { backgroundColor: "#43a047" }]}>
+                        <Ionicons name="checkmark" size={16} color="#fff" /><Text style={styles.refreshText}>Accept</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity onPress={() => respondTo(u.uid, "decline")} style={[styles.reqBtn, { backgroundColor: "#8e0000", marginLeft: 6 }]}>
+                        <Ionicons name="close" size={16} color="#fff" />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </View>
+              )}
+
               <View style={styles.rowBetween}>
                 <Text style={styles.sectionTitle}>My Connections</Text>
                 <TouchableOpacity onPress={loadConnections} style={styles.refreshBtn} disabled={loadingConn}>
@@ -289,9 +335,26 @@ export default function ProfileScreen({ route, navigation }) {
                       <Text style={{ fontWeight: "700", color: "#222" }}>{u.name || `User #${u.uid}`}</Text>
                       <Text style={{ color: "#555" }}>{typeof u.year !== "undefined" ? `Year ${u.year}` : "Student"}</Text>
                     </View>
-                    <View style={styles.connBadge}><Ionicons name="checkmark-done" size={14} color="#fff" /><Text style={styles.connBadgeText}>Connected</Text></View>
+                    <View style={styles.connBadge}><Ionicons name="checkmark-done" size={14} color="#fff" /><Text style={styles.connBadgeText}>1st • Connected</Text></View>
                   </View>
                 ))
+              )}
+
+              {/* Requests I sent that are still waiting */}
+              {outgoing.length > 0 && (
+                <View style={{ marginTop: 14 }}>
+                  <Text style={styles.sectionTitle}>Sent Requests ({outgoing.length})</Text>
+                  {outgoing.map((u) => (
+                    <View key={`out-${u.uid}`} style={styles.connCard}>
+                      <Ionicons name="person-circle-outline" size={28} color="#9e9e9e" />
+                      <View style={{ marginLeft: 10, flex: 1 }}>
+                        <Text style={{ fontWeight: "700", color: "#222" }}>{u.name || `User #${u.uid}`}</Text>
+                        <Text style={{ color: "#555" }}>Waiting for them to accept</Text>
+                      </View>
+                      <View style={[styles.connBadge, { backgroundColor: "#9e9e9e" }]}><Ionicons name="time-outline" size={14} color="#fff" /><Text style={styles.connBadgeText}>Pending</Text></View>
+                    </View>
+                  ))}
+                </View>
               )}
             </ScrollView>
           ) : (
@@ -353,4 +416,7 @@ const styles = StyleSheet.create({
   connBadgeText:{ color:"#fff", fontWeight:"700", fontSize:12 },
   refreshBtn:{ flexDirection:"row", alignItems:"center", gap:6, backgroundColor:"#1a73e8", paddingVertical:6, paddingHorizontal:10, borderRadius:8 },
   refreshText:{ color:"#fff", fontWeight:"700" },
+  reqBtn:{ flexDirection:"row", alignItems:"center", gap:4, paddingVertical:6, paddingHorizontal:10, borderRadius:8 },
+  alertBadge:{ backgroundColor:"#ff9800", paddingHorizontal:6, paddingVertical:1, borderRadius:9999 },
+  alertBadgeText:{ color:"#fff", fontSize:11, fontWeight:"700" },
 });

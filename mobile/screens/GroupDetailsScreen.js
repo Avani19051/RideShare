@@ -37,8 +37,10 @@ export default function GroupDetailScreen({ route, navigation }) {
   const [joining, setJoining] = useState(false);
   const [user, setUser] = useState(routeUser);
 
-  // NEW: cache my connections to hide Connect CTA
+  // My connections + pending requests (to pick the right CTA per member)
   const [connectedUids, setConnectedUids] = useState(new Set());
+  const [outgoingUids, setOutgoingUids] = useState(new Set()); // I sent, waiting for them
+  const [incomingUids, setIncomingUids] = useState(new Set()); // they sent, waiting for me
   const [loadingConn, setLoadingConn] = useState(false);
 
   useEffect(() => {
@@ -52,10 +54,23 @@ export default function GroupDetailScreen({ route, navigation }) {
     })();
   }, []);
 
-  // NEW: fetch my connections once we know user
+  // Re-fetch the group so connection degrees are computed for this viewer
+  async function refreshGroup() {
+    if (!group?.gid) return;
+    const token = await AsyncStorage.getItem("accessToken");
+    if (!token) return;
+    const { resp, data } = await safeFetch(
+      `${BACKEND_BASE.replace(/\/+$/, "")}/groups/${group.gid}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (resp?.ok && data?.ok && data.group) setGroup(data.group);
+  }
+
+  // Fetch my connections + fresh group once we know user
   useEffect(() => {
     (async () => {
       if (!user?.uid) return;
+      refreshGroup();
       try {
         setLoadingConn(true);
         const token = await AsyncStorage.getItem("accessToken");
@@ -65,7 +80,10 @@ export default function GroupDetailScreen({ route, navigation }) {
           { headers: { Authorization: `Bearer ${token}` } }
         );
         if (resp?.ok && data?.ok && Array.isArray(data.connections)) {
-          setConnectedUids(new Set(data.connections.map((u) => Number(u.uid))));
+          const ids = (arr) => new Set((arr || []).map((u) => Number(u.uid)));
+          setConnectedUids(ids(data.connections));
+          setOutgoingUids(ids(data.outgoing));
+          setIncomingUids(ids(data.incoming));
         }
       } finally {
         setLoadingConn(false);
@@ -163,7 +181,11 @@ export default function GroupDetailScreen({ route, navigation }) {
     }
   }
 
-  // ----- CONNECT (new) -----
+  // ----- CONNECT: send request / accept / decline -----
+  const addTo = (setter, id) => setter((prev) => new Set(prev).add(Number(id)));
+  const removeFrom = (setter, id) =>
+    setter((prev) => { const n = new Set(prev); n.delete(Number(id)); return n; });
+
   async function connectTo(other_uid) {
     try {
       const token = await AsyncStorage.getItem("accessToken");
@@ -176,15 +198,55 @@ export default function GroupDetailScreen({ route, navigation }) {
       if (!resp || !resp.ok || !data?.ok) {
         return Alert.alert("Failed", data?.error || `HTTP ${resp?.status || "?"}`);
       }
-      // mark as connected locally to hide CTA
-      setConnectedUids((prev) => new Set(prev).add(Number(other_uid)));
-      Alert.alert("Connected!", data.message || "Connection created");
+      if (data.status === "accepted") {
+        removeFrom(setIncomingUids, other_uid);
+        addTo(setConnectedUids, other_uid);
+        refreshGroup();
+        Alert.alert("Connected!", data.message || "You are now connected");
+      } else {
+        addTo(setOutgoingUids, other_uid);
+        Alert.alert("Request sent", "They'll be connected with you once they accept.");
+      }
+    } catch (e) {
+      Alert.alert("Network error", e?.message || "Try later");
+    }
+  }
+
+  async function respondTo(from_uid, action) {
+    try {
+      const token = await AsyncStorage.getItem("accessToken");
+      if (!token) return Alert.alert("Login required");
+      const { resp, data } = await safeFetch(`${BACKEND_BASE.replace(/\/+$/, "")}/connections/respond`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ from_uid, action }),
+      });
+      if (!resp || !resp.ok || !data?.ok) {
+        return Alert.alert("Failed", data?.error || `HTTP ${resp?.status || "?"}`);
+      }
+      removeFrom(setIncomingUids, from_uid);
+      if (action === "accept") {
+        addTo(setConnectedUids, from_uid);
+        refreshGroup();
+        Alert.alert("Connected!", "Connection request accepted");
+      } else {
+        Alert.alert("Declined", "Connection request declined");
+      }
     } catch (e) {
       Alert.alert("Network error", e?.message || "Try later");
     }
   }
 
   const routeArr = group.route || [];
+  // uid -> { degree, degree_label } for members reachable within 3 hops
+  const degreeByUid = new Map(
+    (group.mutual_friends || []).map((f) => [Number(f.uid), f])
+  );
+  const DEGREE_TEXT = {
+    1: "Your connection",
+    2: "Connection of a connection",
+    3: "3rd-degree connection",
+  };
 
   return (
     <LinearGradient colors={["#fce4ec", "#e3f2fd"]} style={{ flex: 1, padding: 16 }}>
@@ -211,22 +273,53 @@ export default function GroupDetailScreen({ route, navigation }) {
             group.members.map((m) => {
               const isSelf = Number(m.uid) === Number(user?.uid);
               const alreadyConnected = connectedUids.has(Number(m.uid));
+              const requested = outgoingUids.has(Number(m.uid));
+              const theyRequested = incomingUids.has(Number(m.uid));
               return (
                 <View
                   key={m.uid}
                   style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}
                 >
-                  <Text style={styles.item}>
-                    • {m.name}
-                    {typeof m.year !== "undefined" ? ` — Yr ${m.year}` : ""}
-                  </Text>
+                  <View style={{ flexShrink: 1, marginRight: 8 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <Text style={styles.item}>
+                        • {m.name}
+                        {typeof m.year !== "undefined" && m.year !== null ? ` — Yr ${m.year}` : ""}
+                      </Text>
+                      {!isSelf && degreeByUid.has(Number(m.uid)) && (
+                        <View style={[styles.degreeBadge, styles[`degree${degreeByUid.get(Number(m.uid)).degree}`]]}>
+                          <Text style={styles.degreeText}>{degreeByUid.get(Number(m.uid)).degree_label}</Text>
+                        </View>
+                      )}
+                    </View>
+                    {!isSelf && degreeByUid.has(Number(m.uid)) && (
+                      <Text style={styles.degreeHint}>
+                        {DEGREE_TEXT[degreeByUid.get(Number(m.uid)).degree] || ""}
+                      </Text>
+                    )}
+                  </View>
 
-                  {/* Hide CTA for self; show status if already connected */}
+                  {/* Hide CTA for self; otherwise show connection state */}
                   {!isSelf && (
                     alreadyConnected ? (
                       <View style={styles.connBadge}>
                         <Ionicons name="checkmark-done" size={14} color="#fff" />
                         <Text style={styles.connBadgeText}>Connected</Text>
+                      </View>
+                    ) : requested ? (
+                      <View style={[styles.connBadge, styles.pendingBadge]}>
+                        <Ionicons name="time-outline" size={14} color="#fff" />
+                        <Text style={styles.connBadgeText}>Requested</Text>
+                      </View>
+                    ) : theyRequested ? (
+                      <View style={{ flexDirection: "row", gap: 6 }}>
+                        <TouchableOpacity onPress={() => respondTo(m.uid, "accept")} style={[styles.connectBtn, styles.acceptBtn]}>
+                          <Ionicons name="checkmark" size={16} color="#fff" />
+                          <Text style={styles.connectText}>Accept</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity onPress={() => respondTo(m.uid, "decline")} style={[styles.connectBtn, styles.declineBtn]}>
+                          <Ionicons name="close" size={16} color="#fff" />
+                        </TouchableOpacity>
                       </View>
                     ) : (
                       <TouchableOpacity onPress={() => connectTo(m.uid)} style={styles.connectBtn} disabled={loadingConn}>
@@ -290,4 +383,14 @@ const styles = StyleSheet.create({
   // Connected badge
   connBadge: { flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#43a047", paddingVertical: 4, paddingHorizontal: 8, borderRadius: 9999 },
   connBadgeText: { color: "#fff", fontWeight: "700", fontSize: 12 },
+  pendingBadge: { backgroundColor: "#9e9e9e" },
+  // Degree badges (1st / 2nd / 3rd)
+  degreeBadge: { marginTop: 6, paddingHorizontal: 7, paddingVertical: 1, borderRadius: 9999 },
+  degree1: { backgroundColor: "#1a73e8" },
+  degree2: { backgroundColor: "#7e57c2" },
+  degree3: { backgroundColor: "#9e9e9e" },
+  degreeText: { color: "#fff", fontSize: 11, fontWeight: "700" },
+  degreeHint: { color: "#777", fontSize: 11, marginLeft: 10 },
+  acceptBtn: { backgroundColor: "#43a047" },
+  declineBtn: { backgroundColor: "#8e0000" },
 });

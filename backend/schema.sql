@@ -35,9 +35,12 @@ CREATE TABLE IF NOT EXISTS connections (
   id SERIAL PRIMARY KEY,
   u1 INT REFERENCES users(uid) NOT NULL,
   u2 INT REFERENCES users(uid) NOT NULL,
+  status TEXT NOT NULL DEFAULT 'accepted', -- 'pending' until u2 accepts u1's request
   created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
   CONSTRAINT connections_no_self CHECK (u1 <> u2)
 );
+
+ALTER TABLE connections ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'accepted';
 
 CREATE UNIQUE INDEX IF NOT EXISTS connections_undirected_unique
   ON connections (LEAST(u1, u2), GREATEST(u1, u2));
@@ -62,7 +65,7 @@ CREATE OR REPLACE FUNCTION user_connection_degree(a INT, b INT) RETURNS INT AS $
       bfs.path || CASE WHEN c.u1 = bfs.node THEN c.u2 ELSE c.u1 END
     FROM bfs
     JOIN connections c
-      ON c.u1 = bfs.node OR c.u2 = bfs.node
+      ON (c.u1 = bfs.node OR c.u2 = bfs.node) AND c.status = 'accepted'
     WHERE NOT (CASE WHEN c.u1 = bfs.node THEN c.u2 ELSE c.u1 END = ANY(bfs.path))
   )
   SELECT MIN(depth) FROM bfs WHERE node = b;

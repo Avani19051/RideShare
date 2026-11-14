@@ -53,6 +53,18 @@ ensureRefreshTable().catch((e) =>
   console.warn("refresh_tokens ensure error:", e?.message)
 );
 
+// Connection requests: u1 = requester, u2 = recipient.
+// status 'pending' until the recipient accepts; existing rows default to 'accepted'.
+async function ensureConnectionStatus() {
+  await pool.query(`
+    ALTER TABLE connections
+      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'accepted';
+  `);
+}
+ensureConnectionStatus().catch((e) =>
+  console.warn("connections.status ensure error:", e?.message)
+);
+
 // -------------------- Utilities --------------------
 function ok(res, data = {}) {
   return res.status(200).json({ ok: true, ...data });
@@ -155,7 +167,8 @@ async function formatGroupByRow(row, viewer_uid = null) {
   // Build route array directly from DB row (stops = "A|B|C")
   const route = [row.start, ...(row.stops ? row.stops.split("|") : []), row.dest].filter(Boolean);
 
-  // Compute mutuals (LinkedIn-style) = shortest degree via unbounded BFS over undirected edges
+  // Compute mutuals (LinkedIn-style) = shortest degree (max 3) via BFS over accepted connections
+  //   1st = your connection, 2nd = connection of a connection, 3rd = connection of a 2nd
   let mutual_friends = [];
   if (viewer_uid && members.length) {
     const targetUids = members
@@ -175,8 +188,9 @@ async function formatGroupByRow(row, viewer_uid = null) {
             b.path || CASE WHEN c.u1 = b.uid THEN c.u2 ELSE c.u1 END
           FROM bfs b
           JOIN connections c
-            ON c.u1 = b.uid OR c.u2 = b.uid
-          WHERE NOT (CASE WHEN c.u1 = b.uid THEN c.u2 ELSE c.u1 END = ANY(b.path))
+            ON (c.u1 = b.uid OR c.u2 = b.uid) AND c.status = 'accepted'
+          WHERE b.depth < 3
+            AND NOT (CASE WHEN c.u1 = b.uid THEN c.u2 ELSE c.u1 END = ANY(b.path))
         )
         SELECT u.uid, u.name, MIN(b.depth) AS degree
         FROM bfs b
@@ -193,8 +207,11 @@ async function formatGroupByRow(row, viewer_uid = null) {
         uid: r.uid,
         name: r.name,
         degree: Number(r.degree),
-        degree_label: (Number(r.degree) === 1) ? "1st" :
-                      (Number(r.degree) === 2) ? "2nd" : "3rd+"
+        degree_label: ["", "1st", "2nd", "3rd"][Number(r.degree)] || "3rd",
+        degree_desc:
+          Number(r.degree) === 1 ? "your connection" :
+          Number(r.degree) === 2 ? "connection of your connection" :
+                                   "3rd-degree connection",
       }));
     }
   }
@@ -411,44 +428,98 @@ app.post("/logout", requireAuth, async (req, res) => {
   }
 });
 
-// -------------------- CONNECTION (single route) --------------------
+// -------------------- CONNECTIONS (request → accept) --------------------
+// Send a connection request. If the other user already sent me one, this accepts it.
 app.post("/connections", requireAuth, async (req, res) => {
   try {
-    const uid = req.user.uid;
+    const uid = Number(req.user.uid);
     const other = parseInt(req.body?.other_uid, 10);
     if (!other || other === uid) return respondError(res, 400, "invalid other_uid");
-    const q = `
-      INSERT INTO connections (u1, u2)
-      VALUES ($1,$2)
-      ON CONFLICT DO NOTHING
-      RETURNING id, u1, u2, created_at
-    `;
-    const r = await pool.query(q, [uid, other]);
-    const existed = r.rowCount === 0;
-    return ok(res, {
-      created: !existed,
-      message: existed ? "connection already exists" : "connection created",
-      connection: r.rows?.[0] || null
-    });
+
+    const u = await pool.query(`SELECT 1 FROM users WHERE uid=$1`, [other]);
+    if (!u.rowCount) return respondError(res, 404, "user not found");
+
+    const existing = await pool.query(
+      `SELECT id, u1, u2, status FROM connections
+       WHERE LEAST(u1,u2)=LEAST($1::int,$2::int) AND GREATEST(u1,u2)=GREATEST($1::int,$2::int)`,
+      [uid, other]
+    );
+    const row = existing.rows[0];
+
+    if (row) {
+      if (row.status === "accepted") {
+        return ok(res, { status: "accepted", message: "already connected" });
+      }
+      if (Number(row.u1) === uid) {
+        return ok(res, { status: "pending", message: "request already sent" });
+      }
+      // They had already requested me → accept it
+      await pool.query(`UPDATE connections SET status='accepted' WHERE id=$1`, [row.id]);
+      return ok(res, { status: "accepted", message: "connection request accepted" });
+    }
+
+    await pool.query(
+      `INSERT INTO connections (u1, u2, status) VALUES ($1,$2,'pending') ON CONFLICT DO NOTHING`,
+      [uid, other]
+    );
+    return ok(res, { status: "pending", message: "connection request sent" });
   } catch (e) {
     console.error("POST /connections error:", e);
     return respondError(res, 500, "server error");
   }
 });
 
-// NEW: list my connections (for UI to hide/show Connect CTA)
+// Accept or decline a request that another user sent me
+app.post("/connections/respond", requireAuth, async (req, res) => {
+  try {
+    const uid = Number(req.user.uid);
+    const from = parseInt(req.body?.from_uid, 10);
+    const action = String(req.body?.action || "").toLowerCase();
+    if (!from || !["accept", "decline"].includes(action)) {
+      return respondError(res, 400, "from_uid and action (accept|decline) required");
+    }
+    const r =
+      action === "accept"
+        ? await pool.query(
+            `UPDATE connections SET status='accepted'
+             WHERE u1=$1 AND u2=$2 AND status='pending' RETURNING id`,
+            [from, uid]
+          )
+        : await pool.query(
+            `DELETE FROM connections
+             WHERE u1=$1 AND u2=$2 AND status='pending' RETURNING id`,
+            [from, uid]
+          );
+    if (!r.rowCount) return respondError(res, 404, "no pending request from this user");
+    return ok(res, {
+      status: action === "accept" ? "accepted" : "declined",
+      message: action === "accept" ? "connection request accepted" : "connection request declined",
+    });
+  } catch (e) {
+    console.error("POST /connections/respond error:", e);
+    return respondError(res, 500, "server error");
+  }
+});
+
+// My accepted connections + pending requests (incoming / outgoing)
 app.get("/connections/me", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
     const q = `
-      SELECT u.uid, u.name, u.gender, u.year
+      SELECT u.uid, u.name, u.gender, u.year, c.status,
+             CASE WHEN c.u1=$1 THEN 'outgoing' ELSE 'incoming' END AS direction
       FROM connections c
       JOIN users u ON u.uid = (CASE WHEN c.u1=$1 THEN c.u2 ELSE c.u1 END)
       WHERE c.u1=$1 OR c.u2=$1
       ORDER BY u.name ASC
     `;
-    const r = await pool.query(q, [uid]);
-    return ok(res, { connections: r.rows || [] });
+    const rows = (await pool.query(q, [uid])).rows || [];
+    const pick = ({ uid, name, gender, year }) => ({ uid, name, gender, year });
+    return ok(res, {
+      connections: rows.filter((r) => r.status === "accepted").map(pick),
+      incoming: rows.filter((r) => r.status === "pending" && r.direction === "incoming").map(pick),
+      outgoing: rows.filter((r) => r.status === "pending" && r.direction === "outgoing").map(pick),
+    });
   } catch (e) {
     console.error("GET /connections/me error:", e);
     return respondError(res, 500, "server error");
@@ -462,11 +533,11 @@ app.get("/connections/suggested", requireAuth, async (req, res) => {
     const q = `
       WITH neighbors AS (
         SELECT CASE WHEN c.u1=$1 THEN c.u2 ELSE c.u1 END AS uid
-        FROM connections c WHERE c.u1=$1 OR c.u2=$1
+        FROM connections c WHERE (c.u1=$1 OR c.u2=$1) AND c.status='accepted'
       ),
       fof AS (
         SELECT DISTINCT CASE WHEN c.u1=n.uid THEN c.u2 ELSE c.u1 END AS uid
-        FROM connections c JOIN neighbors n ON c.u1=n.uid OR c.u2=n.uid
+        FROM connections c JOIN neighbors n ON (c.u1=n.uid OR c.u2=n.uid) AND c.status='accepted'
       )
       SELECT u.uid, u.name, u.year
       FROM fof JOIN users u ON u.uid=fof.uid

@@ -322,7 +322,14 @@ export default function GroupDetailScreen({ route, navigation }) {
                     </View>
                     {!isSelf && degreeByUid.has(Number(m.uid)) && (
                       <Text style={styles.degreeHint}>
-                        {DEGREE_TEXT[degreeByUid.get(Number(m.uid)).degree] || ""}
+                        {(() => {
+                          const f = degreeByUid.get(Number(m.uid));
+                          const chain = (f.via || []).map((v) => v.name).join(" → ");
+                          if (f.degree === 1) return "Your connection";
+                          if (f.degree === 2 && chain) return `Connection of ${chain}`;
+                          if (chain) return `Connected via ${chain}`;
+                          return f.degree_desc || DEGREE_TEXT[f.degree] || "";
+                        })()}
                       </Text>
                     )}
                   </View>

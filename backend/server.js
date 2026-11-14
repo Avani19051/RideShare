@@ -210,27 +210,47 @@ async function formatGroupByRow(row, viewer_uid = null) {
           WHERE b.depth < 3
             AND NOT (CASE WHEN c.u1 = b.uid THEN c.u2 ELSE c.u1 END = ANY(b.path))
         )
-        SELECT u.uid, u.name, MIN(b.depth) AS degree
+        -- shortest path per member (ties broken by path so results are stable)
+        SELECT DISTINCT ON (u.uid) u.uid, u.name, b.depth AS degree, b.path
         FROM bfs b
         JOIN users u ON u.uid = b.uid
         WHERE b.depth > 0
           AND b.uid = ANY($2::int[])
-        GROUP BY u.uid, u.name
-        ORDER BY degree ASC, u.name ASC;
+        ORDER BY u.uid, b.depth ASC, b.path ASC;
       `;
       const res = await pool.query(q, [viewer_uid, targetUids]);
+      const rows = res.rows || [];
 
-      // add LinkedIn-style labels
-      mutual_friends = (res.rows || []).map(r => ({
-        uid: r.uid,
-        name: r.name,
-        degree: Number(r.degree),
-        degree_label: ["", "1st", "2nd", "3rd"][Number(r.degree)] || "3rd",
-        degree_desc:
-          Number(r.degree) === 1 ? "your connection" :
-          Number(r.degree) === 2 ? "connection of your connection" :
-                                   "3rd-degree connection",
-      }));
+      // Names of the people in between (path = [viewer, ..., member])
+      const viaIds = [...new Set(rows.flatMap(r => (r.path || []).slice(1, -1).map(Number)))];
+      const nameById = new Map();
+      if (viaIds.length) {
+        const n = await pool.query(`SELECT uid, name FROM users WHERE uid = ANY($1::int[])`, [viaIds]);
+        n.rows.forEach(x => nameById.set(Number(x.uid), x.name));
+      }
+
+      // LinkedIn-style labels + who connects you
+      mutual_friends = rows
+        .map(r => {
+          const degree = Number(r.degree);
+          const via = (r.path || []).slice(1, -1).map(id => ({
+            uid: Number(id),
+            name: nameById.get(Number(id)) || `User #${id}`,
+          }));
+          const chain = via.map(v => v.name).join(" → ");
+          return {
+            uid: r.uid,
+            name: r.name,
+            degree,
+            degree_label: ["", "1st", "2nd", "3rd"][degree] || "3rd",
+            via,                       // [] for 1st, [A] for 2nd, [A, B] for 3rd
+            degree_desc:
+              degree === 1 ? "Your connection" :
+              degree === 2 ? `Connection of ${chain}` :
+                             `Connected via ${chain}`,
+          };
+        })
+        .sort((x, y) => x.degree - y.degree || String(x.name).localeCompare(String(y.name)));
     }
   }
 

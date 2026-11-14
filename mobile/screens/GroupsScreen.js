@@ -164,7 +164,13 @@ export default function GroupsScreen({ route, navigation }) {
         {mutualCount>0 && (
           <View style={{ marginTop:6 }}>
             <View style={styles.badge}><Text style={styles.badgeText}>{mutualCount} mutual {mutualCount>1?"connections":"connection"}</Text></View>
-            <Text style={{ marginTop:4, color:"#666" }}>{(item.mutual_friends||[]).map(m=>`${m.name} (${m.degree_label||`deg ${m.degree}`})`).join(", ")}</Text>
+            {(item.mutual_friends||[]).map(m=>(
+              <Text key={m.uid} style={{ marginTop:3, color:"#555" }}>
+                <Text style={{ fontWeight:"700", color: m.degree===1 ? "#1a73e8" : m.degree===2 ? "#7e57c2" : "#757575" }}>{m.degree_label||`deg ${m.degree}`}</Text>
+                {"  "}{m.name}
+                {m.via?.length ? <Text style={{ color:"#888" }}>{`  · via ${m.via.map(v=>v.name).join(" → ")}`}</Text> : null}
+              </Text>
+            ))}
           </View>
         )}
       </TouchableOpacity>

@@ -35,6 +35,7 @@ export default function GroupsScreen({ route, navigation }) {
   const [wholeDay, setWholeDay] = useState(true);
   const [windowMins, setWindowMins] = useState("60");
   const [onlyMutuals, setOnlyMutuals] = useState(false);
+  const [showingAll, setShowingAll] = useState(false); // true = "Show all rides" list
 
   const isMounted = useRef(true);
   useEffect(()=>()=>{ isMounted.current=false; },[]);
@@ -71,6 +72,7 @@ export default function GroupsScreen({ route, navigation }) {
           Alert.alert("Search error", data.error);
         }
       }else{
+        setShowingAll(false);
         const list = Array.isArray(data.groups) ? data.groups : [];
         const filtered = onlyMutuals ? list.filter(g => (g.mutual_count||g.mutual_friends?.length||0)>0) : list;
         filtered.sort((a,b)=>(b.mutual_count||b.mutual_friends?.length||0)-(a.mutual_count||a.mutual_friends?.length||0) || (b.seats_left||0)-(a.seats_left||0));
@@ -81,6 +83,44 @@ export default function GroupsScreen({ route, navigation }) {
       setGroups([]); Alert.alert("Network error","Could not reach server");
     }finally{ setLoading(false); }
   }, [start,dest,preference,groupSize,date,wholeDay,windowMins,onlyMutuals,canSearch,navigation]);
+
+  // Show every upcoming ride, ignoring route / date / seat filters
+  const loadAllRides = useCallback(async ()=>{
+    setLoading(true);
+    const token = await AsyncStorage.getItem("accessToken");
+    if(!token){ setLoading(false); Alert.alert("Login required","Please login to see rides."); navigation.reset({ index:0, routes:[{ name:"Login" }]} ); return; }
+    try{
+      const { resp, data } = await safeFetch(`${BACKEND_BASE.replace(/\/+$/,"")}/search-groups`, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", Authorization:`Bearer ${token}` },
+        body: JSON.stringify({}),
+      });
+      if(!resp || !resp.ok || !data?.ok){
+        setGroups([]);
+        if(data?.error && String(data.error).toLowerCase().includes("token")){
+          Alert.alert("Session expired","Please login again.");
+          await AsyncStorage.multiRemove(["user","accessToken","refreshToken"]);
+          navigation.reset({ index:0, routes:[{ name:"Login" }]} );
+          return;
+        }
+        if(data?.error) Alert.alert("Error", data.error);
+        return;
+      }
+      const now = Date.now();
+      const list = (Array.isArray(data.groups) ? data.groups : [])
+        .filter(g => !g.departure_date || new Date(g.departure_date).getTime() >= now)
+        .sort((a,b)=> new Date(a.departure_date||0) - new Date(b.departure_date||0));
+      setShowingAll(true);
+      setGroups(list);
+    }catch(err){
+      setGroups([]); Alert.alert("Network error","Could not reach server");
+    }finally{ setLoading(false); }
+  }, [navigation]);
+
+  const formatWhen = (iso)=>{
+    if(!iso) return null; const d = new Date(iso); if(isNaN(d.getTime())) return null;
+    return `${d.toLocaleDateString([], { weekday:"short", day:"2-digit", month:"short" })} • ${d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" })}`;
+  };
 
   function handleBack(){ navigation.goBack(); }
 
@@ -106,6 +146,15 @@ export default function GroupsScreen({ route, navigation }) {
     return (
       <TouchableOpacity style={styles.card} onPress={()=>navigation.navigate("GroupDetails",{ group:item, user })}>
         <Text style={styles.cardTitle}>{routeText}</Text>
+        {formatWhen(item.departure_date) && (
+          <Text style={[styles.small,{ marginTop:4 }]}>🕒 {formatWhen(item.departure_date)}</Text>
+        )}
+        {(item.driver?.name || item.driver?.car_model) && (
+          <Text style={[styles.small,{ marginTop:4 }]}>
+            🚗 {[item.driver?.car_model, item.driver?.car_number].filter(Boolean).join(" • ")}
+            {item.driver?.name ? `  —  Driver: ${item.driver.name}` : ""}
+          </Text>
+        )}
         <View style={styles.row}>
           <Text style={styles.small}>Seats left: {item.seats_left}</Text>
           <View style={[styles.chip, { backgroundColor: item.preference==="FEMALE_ONLY" ? "#f8bbd0" : "#b3e5fc" }]}>
@@ -182,12 +231,19 @@ export default function GroupsScreen({ route, navigation }) {
           <Text style={{ marginLeft:8 }}>Only show with mutuals</Text>
         </View>
 
-        <TouchableOpacity style={[styles.searchBtn, !canSearch && { opacity:0.6 }]} onPress={loadRecommendations} disabled={!canSearch}>
-          <Ionicons name="search" color="#fff" size={20} />
-          <Text style={styles.searchText}>Find Rides</Text>
-        </TouchableOpacity>
+        <View style={{ flexDirection:"row", flexWrap:"wrap", gap:10 }}>
+          <TouchableOpacity style={[styles.searchBtn, !canSearch && { opacity:0.6 }]} onPress={loadRecommendations} disabled={!canSearch}>
+            <Ionicons name="search" color="#fff" size={20} />
+            <Text style={styles.searchText}>Find Rides</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.searchBtn,{ backgroundColor:"#1976D2" }]} onPress={loadAllRides}>
+            <Ionicons name="list" color="#fff" size={20} />
+            <Text style={styles.searchText}>Show all rides</Text>
+          </TouchableOpacity>
+        </View>
 
-        {!canSearch && <Text style={{ marginTop:10, color:"#666" }}>Enter both From and To to search available groups.</Text>}
+        {!canSearch && !showingAll && <Text style={{ marginTop:10, color:"#666" }}>Enter both From and To to search, or tap "Show all rides".</Text>}
+        {showingAll && !loading && <Text style={{ marginTop:10, color:"#444", fontWeight:"700" }}>All upcoming rides ({groups.length})</Text>}
 
         {loading ? <ActivityIndicator size="large" color="#E53935" style={{ marginTop:16 }}/> : <FlatList data={groups} keyExtractor={(it)=>String(it.gid)} renderItem={renderItem} style={{ marginTop:10 }}/>}
       </View>

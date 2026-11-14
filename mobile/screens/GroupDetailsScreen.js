@@ -8,6 +8,7 @@ import {
   Alert,
   ActivityIndicator,
   Platform,
+  Linking,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
@@ -264,9 +265,36 @@ export default function GroupDetailScreen({ route, navigation }) {
           <Text style={styles.title}>Route</Text>
           <Text style={styles.route}>{routeArr.join(" → ")}</Text>
 
+          {group.departure_date ? (
+            <Text style={styles.item}>
+              Departure: {new Date(group.departure_date).toLocaleString([], { weekday:"short", day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
+            </Text>
+          ) : null}
           <Text style={styles.item}>Preference: {group.preference || "ALL"}</Text>
           <Text style={styles.item}>Seats left: {group.seats_left ?? "-"}</Text>
           <Text style={styles.item}>Capacity: {group.capacity ?? "-"}</Text>
+
+          {/* Driver & car */}
+          {(group.driver?.name || group.driver?.phone || group.driver?.car_model || group.driver?.car_number) ? (
+            <View style={styles.driverBox}>
+              <Text style={styles.subTitle}>Driver & Car</Text>
+              {group.driver?.name ? (
+                <Text style={styles.item}><Ionicons name="person-outline" size={14} /> {group.driver.name}</Text>
+              ) : null}
+              {group.driver?.phone ? (
+                <TouchableOpacity onPress={() => Linking.openURL(`tel:${String(group.driver.phone).replace(/\s+/g, "")}`)}>
+                  <Text style={[styles.item, { color: "#1a73e8", fontWeight: "700" }]}>
+                    <Ionicons name="call-outline" size={14} /> {group.driver.phone}
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
+              {(group.driver?.car_model || group.driver?.car_number) ? (
+                <Text style={styles.item}>
+                  <Ionicons name="car-outline" size={14} /> {[group.driver.car_model, group.driver.car_number].filter(Boolean).join(" • ")}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
 
           <Text style={[styles.subTitle, { marginTop: 12 }]}>Members</Text>
           {group.members?.length ? (
@@ -384,6 +412,7 @@ const styles = StyleSheet.create({
   connBadge: { flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#43a047", paddingVertical: 4, paddingHorizontal: 8, borderRadius: 9999 },
   connBadgeText: { color: "#fff", fontWeight: "700", fontSize: 12 },
   pendingBadge: { backgroundColor: "#9e9e9e" },
+  driverBox: { marginTop: 12, padding: 10, borderRadius: 10, backgroundColor: "rgba(25,118,210,0.06)", borderWidth: 1, borderColor: "rgba(25,118,210,0.15)" },
   // Degree badges (1st / 2nd / 3rd)
   degreeBadge: { marginTop: 6, paddingHorizontal: 7, paddingVertical: 1, borderRadius: 9999 },
   degree1: { backgroundColor: "#1a73e8" },

@@ -65,6 +65,24 @@ ensureConnectionStatus().catch((e) =>
   console.warn("connections.status ensure error:", e?.message)
 );
 
+// Driver / car details for each ride (all optional)
+async function ensureDriverColumns() {
+  await pool.query(`
+    ALTER TABLE groups
+      ADD COLUMN IF NOT EXISTS driver_name  TEXT,
+      ADD COLUMN IF NOT EXISTS driver_phone TEXT,
+      ADD COLUMN IF NOT EXISTS car_model    TEXT,
+      ADD COLUMN IF NOT EXISTS car_number   TEXT;
+  `);
+}
+ensureDriverColumns().catch((e) =>
+  console.warn("groups driver columns ensure error:", e?.message)
+);
+const cleanText = (v, max = 64) => {
+  const t = String(v ?? "").replace(/\s+/g, " ").trim();
+  return t ? t.slice(0, max) : null;
+};
+
 // -------------------- Utilities --------------------
 function ok(res, data = {}) {
   return res.status(200).json({ ok: true, ...data });
@@ -228,6 +246,12 @@ async function formatGroupByRow(row, viewer_uid = null) {
     capacity: row.capacity,
     preference: row.preference,
     created_by: row.created_by,
+    driver: {
+      name: row.driver_name || null,
+      phone: row.driver_phone || null,
+      car_model: row.car_model || null,
+      car_number: row.car_number || null,
+    },
     members,                      // includes year
     seats_left,
     mutual_friends,               // degrees for viewer→members (with labels)
@@ -242,14 +266,14 @@ async function formatGroupByRow(row, viewer_uid = null) {
 const posSql = `
 SELECT 
   array_position( 
-    ARRAY[g.start] 
-    || (CASE WHEN g.stops IS NULL OR g.stops='' THEN ARRAY[]::text[] ELSE regexp_split_to_array(g.stops, '\\|') END)
-    || ARRAY[g.dest], $2
+    ARRAY[lower(g.start)] 
+    || (CASE WHEN g.stops IS NULL OR g.stops='' THEN ARRAY[]::text[] ELSE regexp_split_to_array(lower(g.stops), '\\|') END)
+    || ARRAY[lower(g.dest)], lower($2)
   ) AS pos_start,
   array_position( 
-    ARRAY[g.start] 
-    || (CASE WHEN g.stops IS NULL OR g.stops='' THEN ARRAY[]::text[] ELSE regexp_split_to_array(g.stops, '\\|') END)
-    || ARRAY[g.dest], $3
+    ARRAY[lower(g.start)] 
+    || (CASE WHEN g.stops IS NULL OR g.stops='' THEN ARRAY[]::text[] ELSE regexp_split_to_array(lower(g.stops), '\\|') END)
+    || ARRAY[lower(g.dest)], lower($3)
   ) AS pos_dest
 FROM groups g
 WHERE g.gid = $1
@@ -602,6 +626,12 @@ app.post("/create-trip", requireAuth, async (req, res) => {
     const preference = raw.preference ? String(raw.preference).toUpperCase() : "ALL";
     const departure  = raw.departure || null;
     const auto_join_creator = raw.auto_join_creator === false ? false : true;
+    const driver_name  = cleanText(raw.driver_name);
+    const driver_phone = cleanText(raw.driver_phone, 20);
+    const car_model    = cleanText(raw.car_model);
+    const car_number   = cleanText(raw.car_number, 20)?.toUpperCase() || null;
+    if (driver_phone && !/^\+?[0-9 \-]{7,20}$/.test(driver_phone))
+      return respondError(res, 400, "invalid driver phone number");
 
     if (!validatePreference(preference))
       return respondError(res, 400, "invalid preference");
@@ -622,10 +652,12 @@ app.post("/create-trip", requireAuth, async (req, res) => {
     try {
       await client.query("BEGIN");
       const insertQ = `
-        INSERT INTO groups (start, dest, stops, departure_date, capacity, preference, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`;
+        INSERT INTO groups (start, dest, stops, departure_date, capacity, preference, created_by,
+                            driver_name, driver_phone, car_model, car_number)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`;
       const r = await client.query(insertQ, [
         startNorm, destNorm, stopsStr, departure, capacity, preference, creator_uid,
+        driver_name, driver_phone, car_model, car_number,
       ]);
       const g = r.rows[0];
 

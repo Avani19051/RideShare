@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
-  View, Text, TextInput, TouchableOpacity, StyleSheet,
+  View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView,
   Alert, ActivityIndicator, Platform
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
@@ -41,6 +41,11 @@ export default function CreateTripScreen({ route, navigation }) {
   const [date, setDate] = useState(new Date());
   const [showPicker, setShowPicker] = useState(false);        // native picker
   const [stopsText, setStopsText] = useState("");
+  // Optional driver / car details
+  const [driverName, setDriverName] = useState("");
+  const [driverPhone, setDriverPhone] = useState("");
+  const [carModel, setCarModel] = useState("");
+  const [carNumber, setCarNumber] = useState("");
   const [loading, setLoading] = useState(false);
 
   // WEB datetime modal state
@@ -107,6 +112,10 @@ export default function CreateTripScreen({ route, navigation }) {
         preference: preference || "ALL",
         departure: date ? date.toISOString() : null,
         stops: stopsPayload,
+        driver_name: driverName.trim() || undefined,
+        driver_phone: driverPhone.trim() || undefined,
+        car_model: carModel.trim() || undefined,
+        car_number: carNumber.trim() || undefined,
       };
 
       const token = await AsyncStorage.getItem("accessToken");
@@ -146,7 +155,7 @@ export default function CreateTripScreen({ route, navigation }) {
   return (
     <View style={{ flex:1 }}>
       <MapBackdrop blur={false} />
-      <View style={styles.sheet}>
+      <ScrollView style={{ flex:1 }} contentContainerStyle={styles.sheet} keyboardShouldPersistTaps="handled">
         <View style={{ flexDirection:"row", justifyContent:"space-between", alignItems:"center" }}>
           <TouchableOpacity onPress={handleBack} style={{ padding:6 }}>
             <Ionicons name="arrow-back" size={22} color="#333" />
@@ -219,16 +228,36 @@ export default function CreateTripScreen({ route, navigation }) {
           />
         </View>
 
+        <Text style={{ fontWeight:"700", color:"#444", marginBottom:6 }}>Driver & car (optional)</Text>
+        <View style={styles.inputRow}>
+          <Ionicons name="person" color="#E53935" size={18} />
+          <TextInput placeholder="Driver name" style={styles.input} value={driverName} onChangeText={setDriverName} />
+        </View>
+        <View style={styles.inputRow}>
+          <Ionicons name="call" color="#E53935" size={18} />
+          <TextInput placeholder="Driver phone number" style={styles.input} keyboardType="phone-pad" value={driverPhone} onChangeText={setDriverPhone} />
+        </View>
+        <View style={{ flexDirection:"row", gap:10 }}>
+          <View style={[styles.inputRow,{ flex:1 }]}>
+            <Ionicons name="car" color="#E53935" size={18} />
+            <TextInput placeholder="Car (e.g., Swift Dzire)" style={styles.input} value={carModel} onChangeText={setCarModel} />
+          </View>
+          <View style={[styles.inputRow,{ flex:1 }]}>
+            <Ionicons name="card" color="#E53935" size={18} />
+            <TextInput placeholder="Car number (PB11AB1234)" style={styles.input} autoCapitalize="characters" value={carNumber} onChangeText={setCarNumber} />
+          </View>
+        </View>
+
         <TouchableOpacity style={[styles.createBtn, loading && { opacity:0.7 }]} onPress={onCreate} disabled={loading}>
           {loading ? <ActivityIndicator color="#fff"/> : (<><Ionicons name="checkmark-circle" color="#fff" size={20}/><Text style={styles.createText}>Create</Text></>)}
         </TouchableOpacity>
-      </View>
+      </ScrollView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  sheet:{ flex:1, padding:16 },
+  sheet:{ padding:16, paddingBottom:40 },
   header:{ fontSize:20, fontWeight:"700", marginBottom:12, color:"#222", textAlign:"center", flex:1 },
   inputRow:{ flexDirection:"row", alignItems:"center", borderWidth:1, borderColor:"#ddd", borderRadius:12, paddingHorizontal:10, marginBottom:10, backgroundColor:"rgba(255,255,255,0.95)" },
   input:{ flex:1, padding:10 },

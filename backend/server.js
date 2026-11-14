@@ -8,6 +8,7 @@ import express from "express";
 import cors from "cors";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import jwt from "jsonwebtoken";
@@ -18,6 +19,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+// Behind Vercel/Render's proxy: use the real client IP (needed for rate limiting)
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -29,13 +32,17 @@ const REFRESH_TOKEN_EXPIRES = process.env.REFRESH_TOKEN_EXPIRES || "30d";
 const DEV_ALLOW_UNKNOWN_CITIES = process.env.DEV_ALLOW_UNKNOWN_CITIES === "true";
 
 // -------------------- Database (TLS forced) --------------------
-const pool = new Pool({
-  // Always ensure sslmode=require on Render/managed PG
-  connectionString: (process.env.DATABASE_URL || "").includes("sslmode=")
-    ? process.env.DATABASE_URL
-    : `${process.env.DATABASE_URL}?sslmode=require`,
-  ssl: { require: true, rejectUnauthorized: false },
-});
+// TLS is required for managed Postgres; local dev can opt out with sslmode=disable
+const DB_URL = process.env.DATABASE_URL || "";
+const DB_NO_SSL = /sslmode=disable/.test(DB_URL);
+const pool = new Pool(
+  DB_NO_SSL
+    ? { connectionString: DB_URL }
+    : {
+        connectionString: DB_URL.includes("sslmode=") ? DB_URL : `${DB_URL}?sslmode=require`,
+        ssl: { require: true, rejectUnauthorized: false },
+      }
+);
 
 // Ensure refresh_tokens exists (idempotent)
 async function ensureRefreshTable() {
@@ -111,6 +118,44 @@ function isPatialaCity(s) {
 }
 
 // -------------------- Auth helpers --------------------
+// Refresh tokens are long-lived and must never work as access tokens.
+// New ones carry typ:"refresh"; older ones are recognised by their long lifetime.
+function isAccessPayload(p) {
+  if (p.typ === "refresh") return false;
+  if (p.exp && p.iat && p.exp - p.iat > 24 * 60 * 60) return false;
+  return true;
+}
+function createRefreshToken(uid) {
+  return jwt.sign(
+    { uid, typ: "refresh", jti: crypto.randomBytes(12).toString("hex") },
+    JWT_SECRET,
+    { expiresIn: REFRESH_TOKEN_EXPIRES }
+  );
+}
+async function issueSession(uid, roll_no) {
+  const accessToken = createAccessToken({ uid, roll_no, typ: "access" });
+  const refreshToken = createRefreshToken(uid);
+  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30);
+  await pool.query(
+    `INSERT INTO refresh_tokens (token, uid, expires_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+    [refreshToken, uid, expiresAt]
+  );
+  return { accessToken, refreshToken };
+}
+
+// Input rules shared by register/login
+const EMAIL_RE = /^[a-z0-9._%+-]+@thapar\.edu$/;
+const NAME_RE = /^[A-Za-z][A-Za-z .'-]{1,59}$/;
+const ROLL_RE = /^[0-9]{6,12}$/;
+function passwordProblem(pw) {
+  if (pw.length < 8) return "password must be at least 8 characters";
+  if (pw.length > 72) return "password must be at most 72 characters";
+  if (!/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw))
+    return "password must contain at least one letter and one number";
+  return null;
+}
+// Used to keep login timing the same whether or not the email exists
+const DUMMY_HASH = "$2b$10$P2unfDgKSy.POpQXyQT4COpa6kl4nVt2IKDvzVl4fCqnq0j8DNrwu";
 // Expect Authorization: Bearer <token> with payload { uid, ... }
 function requireAuth(req, res, next) {
   try {
@@ -118,11 +163,12 @@ function requireAuth(req, res, next) {
     const [, token] = h.split(" ");
     if (!token) return respondError(res, 401, "auth required");
     const payload = jwt.verify(token, JWT_SECRET);
-    if (!payload?.uid) return respondError(res, 401, "invalid token");
+    if (!payload?.uid || !isAccessPayload(payload))
+      return respondError(res, 401, "invalid or expired token");
     req.user = { uid: payload.uid };
     next();
   } catch {
-    return respondError(res, 401, "unauthorized");
+    return respondError(res, 401, "invalid or expired token");
   }
 }
 // Optional helper (non-strict) to read uid if available
@@ -132,17 +178,30 @@ function readUser(req) {
     const [, token] = h.split(" ");
     if (!token) return null;
     const payload = jwt.verify(token, JWT_SECRET);
-    return payload?.uid ? { uid: payload.uid } : null;
+    return payload?.uid && isAccessPayload(payload) ? { uid: payload.uid } : null;
   } catch {
     return null;
   }
 }
 
-// Basic rate limiter for auth endpoints
+// Basic rate limiter for auth endpoints (per IP)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { ok: false, error: "Too many requests, please try again later." },
+});
+// Failed logins: max 10 per 15 min for the same IP + email (successful logins don't count)
+const loginFailLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) =>
+    `${req.ip}|${String(req.body?.email || "").trim().toLowerCase()}`,
+  message: { ok: false, error: "Too many failed login attempts. Try again in 15 minutes." },
 });
 
 // -------------------- City CSV Loader --------------------
@@ -325,91 +384,84 @@ app.get("/cities/search", (req, res) => {
 app.post("/register", authLimiter, async (req, res) => {
   try {
     const raw = req.body || {};
-    const name = String(raw.name || "").trim();
-    const rollNo = String(raw.rollNo || "").trim();
+    const name = String(raw.name || "").replace(/\s+/g, " ").trim();
+    const rollNo = String(raw.rollNo ?? raw.roll_no ?? "").trim();
     const email = String(raw.email || "").trim().toLowerCase();
     const password = String(raw.password || "");
-    const gender = raw.gender ? String(raw.gender).toUpperCase() : null;
-    const year = safeInt(raw.year, null);
-    const contact_number = raw.contact_number
-      ? String(raw.contact_number).trim()
-      : null;
+    const gender = raw.gender ? String(raw.gender).trim().toUpperCase() : "";
+    const yearRaw = String(raw.year ?? "").trim();
+    const year = /^[0-9]+$/.test(yearRaw) ? parseInt(yearRaw, 10) : null;
+    const contact_number = raw.contact_number ? String(raw.contact_number).trim() : null;
 
-    if (!name || !rollNo || !email || !password)
-      return respondError(res, 400, "name, rollNo, email and password required");
-    if (!/@thapar\.edu$/i.test(email))
-      return respondError(res, 400, "please use your thapar.edu email");
-    if (gender && !["M", "F"].includes(gender))
+    const missing = [];
+    if (!name) missing.push("name");
+    if (!rollNo) missing.push("roll number");
+    if (!email) missing.push("email");
+    if (!password) missing.push("password");
+    if (!gender) missing.push("gender");
+    if (!yearRaw) missing.push("year");
+    if (missing.length) return respondError(res, 400, `missing: ${missing.join(", ")}`);
+
+    if (!NAME_RE.test(name))
+      return respondError(res, 400, "name should be 2-60 letters (spaces, . ' - allowed)");
+    if (!ROLL_RE.test(rollNo))
+      return respondError(res, 400, "roll number must be 6-12 digits");
+    if (!EMAIL_RE.test(email))
+      return respondError(res, 400, "please use a valid @thapar.edu email");
+    if (!["M", "F"].includes(gender))
       return respondError(res, 400, "gender must be 'M' or 'F'");
-    if (year !== null && (year < 1 || year > 6))
-      return respondError(res, 400, "year must be between 1 and 6");
-    if (password.length < 8)
-      return respondError(res, 400, "password must be at least 8 characters");
+    if (year === null || year < 1 || year > 5)
+      return respondError(res, 400, "year must be a number from 1 to 5");
+    const pwErr = passwordProblem(password);
+    if (pwErr) return respondError(res, 400, pwErr);
+    if (contact_number && !/^\+?[0-9 \-]{7,20}$/.test(contact_number))
+      return respondError(res, 400, "invalid contact number");
 
     const hashed = await bcrypt.hash(password, 10);
-    const q = `
-      INSERT INTO users (roll_no, name, email, password, gender, year, contact_number)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING uid, roll_no, name, email, gender, year, contact_number
-    `;
-    const vals = [rollNo, name, email, hashed, gender, year, contact_number];
-    const r = await pool.query(q, vals);
-
-    const user = r.rows[0];
-    const accessToken = createAccessToken({
-      uid: user.uid,
-      roll_no: user.roll_no,
-    });
-    const refreshToken = jwt.sign({ uid: user.uid }, JWT_SECRET, {
-      expiresIn: REFRESH_TOKEN_EXPIRES,
-    });
-    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30);
-
-    await pool.query(
-      `INSERT INTO refresh_tokens (token, uid, expires_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-      [refreshToken, user.uid, expiresAt]
+    const r = await pool.query(
+      `INSERT INTO users (roll_no, name, email, password, gender, year, contact_number)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING uid, roll_no, name, email, gender, year, contact_number`,
+      [rollNo, name, email, hashed, gender, year, contact_number]
     );
-
-    return ok(res, { user, accessToken, refreshToken });
+    const user = r.rows[0];
+    const { accessToken, refreshToken } = await issueSession(user.uid, user.roll_no);
+    return res.status(201).json({ ok: true, user, accessToken, refreshToken });
   } catch (err) {
-    if (err && err.code === "23505")
-      return respondError(res, 400, "roll_no or email already exists");
+    if (err && err.code === "23505") {
+      const which = String(err.constraint || err.detail || "");
+      if (/email/i.test(which))
+        return respondError(res, 409, "an account with this email already exists");
+      if (/roll/i.test(which))
+        return respondError(res, 409, "this roll number is already registered");
+      return respondError(res, 409, "this roll number or email is already registered");
+    }
     console.error("register error:", err);
     return respondError(res, 500, "server error");
   }
 });
-
-app.post("/login", authLimiter, async (req, res) => {
+app.post("/login", authLimiter, loginFailLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body || {};
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
     if (!email || !password)
       return respondError(res, 400, "email and password required");
+    if (!EMAIL_RE.test(email))
+      return respondError(res, 400, "please use a valid @thapar.edu email");
+    if (password.length > 72)
+      return respondError(res, 401, "incorrect email or password");
 
-    const emailNorm = String(email).toLowerCase();
     const r = await pool.query(
       `SELECT uid, roll_no, name, email, password, gender, year, contact_number
        FROM users WHERE email = $1 LIMIT 1`,
-      [emailNorm]
+      [email]
     );
-    if (r.rowCount === 0) return respondError(res, 401, "invalid credentials");
-
     const row = r.rows[0];
-    const match = await bcrypt.compare(String(password), row.password);
-    if (!match) return respondError(res, 401, "invalid credentials");
+    // Always run bcrypt so a wrong email takes as long as a wrong password
+    const match = await bcrypt.compare(password, row ? row.password : DUMMY_HASH);
+    if (!row || !match) return respondError(res, 401, "incorrect email or password");
 
-    const accessToken = createAccessToken({
-      uid: row.uid,
-      roll_no: row.roll_no,
-    });
-    const refreshToken = jwt.sign({ uid: row.uid }, JWT_SECRET, {
-      expiresIn: REFRESH_TOKEN_EXPIRES,
-    });
-    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30);
-    await pool.query(
-      `INSERT INTO refresh_tokens (token, uid, expires_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-      [refreshToken, row.uid, expiresAt]
-    );
-
+    const { accessToken, refreshToken } = await issueSession(row.uid, row.roll_no);
     return ok(res, {
       user: {
         uid: row.uid,
@@ -436,10 +488,12 @@ app.post("/token/refresh", authLimiter, async (req, res) => {
 
     let payload;
     try {
-      payload = jwt.verify(refreshToken, JWT_SECRET);
+      payload = jwt.verify(String(refreshToken), JWT_SECRET);
     } catch {
       return respondError(res, 401, "invalid refresh token");
     }
+    if (isAccessPayload(payload))
+      return respondError(res, 401, "invalid refresh token");
 
     const r = await pool.query(
       `SELECT token, uid, expires_at FROM refresh_tokens WHERE token = $1 LIMIT 1`,
@@ -450,7 +504,9 @@ app.post("/token/refresh", authLimiter, async (req, res) => {
     if (r.rows[0].expires_at && new Date(r.rows[0].expires_at) < new Date())
       return respondError(res, 401, "refresh token expired");
 
-    const accessToken = createAccessToken({ uid: r.rows[0].uid });
+    const u = await pool.query(`SELECT uid, roll_no FROM users WHERE uid = $1`, [r.rows[0].uid]);
+    if (!u.rowCount) return respondError(res, 401, "account no longer exists");
+    const accessToken = createAccessToken({ uid: u.rows[0].uid, roll_no: u.rows[0].roll_no, typ: "access" });
     return ok(res, { accessToken });
   } catch (err) {
     console.error("refresh token error:", err);
@@ -458,7 +514,7 @@ app.post("/token/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.post("/logout", requireAuth, async (req, res) => {
+app.post("/logout", async (req, res) => {
   try {
     const { refreshToken } = req.body || {};
     if (!refreshToken) return respondError(res, 400, "refreshToken required");
@@ -725,6 +781,11 @@ app.get("/groups/:gid", requireAuth, async (req, res) => {
 app.post("/search-groups", async (req, res) => {
   try {
     const viewer = readUser(req);
+    // A token was sent but is expired/invalid: tell the app so it can renew it,
+    // instead of silently treating the student as logged out (which would hide
+    // connection badges and show female-only rides to everyone).
+    if (!viewer && /^Bearer\s+\S+/i.test(req.headers.authorization || ""))
+      return respondError(res, 401, "invalid or expired token");
     const viewer_uid = viewer?.uid || null;
 
     const {

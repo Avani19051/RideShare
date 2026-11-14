@@ -4,6 +4,7 @@ import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { Ionicons } from "@expo/vector-icons";
 import * as SplashScreen from "expo-splash-screen";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import LoginScreen from "./screens/LoginScreen";
 import ProfileScreen from "./screens/ProfileScreen";
@@ -23,6 +24,50 @@ export const BACKEND_BASE =
 if (__DEV__) {
   console.log("✅ BACKEND_BASE =", BACKEND_BASE);
 }
+
+// ---------- Session renewal ----------
+// Access tokens last 15 minutes. When an API call comes back 401, swap the
+// stored refresh token for a new access token once and retry the call, so
+// students aren't logged out mid-use. If renewal fails, the session is cleared
+// and the screen's normal "session expired" handling takes over.
+const rawFetch = global.fetch.bind(global);
+let renewing = null;
+
+async function renewAccessToken() {
+  const refreshToken = await AsyncStorage.getItem("refreshToken");
+  if (!refreshToken) return null;
+  try {
+    const r = await rawFetch(`${BACKEND_BASE}/token/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d?.ok && d.accessToken) {
+      await AsyncStorage.setItem("accessToken", d.accessToken);
+      return d.accessToken;
+    }
+    if (r.status === 401) await AsyncStorage.multiRemove(["user", "accessToken", "refreshToken"]);
+  } catch {}
+  return null;
+}
+
+global.fetch = async (input, init = {}) => {
+  const res = await rawFetch(input, init);
+  const url = typeof input === "string" ? input : input?.url || "";
+  if (res.status !== 401 || !url.startsWith(BACKEND_BASE)) return res;
+  if (/\/(login|register|token\/refresh|logout)(\?|$)/.test(url)) return res;
+
+  const headers = { ...(init.headers || {}) };
+  const authKey = Object.keys(headers).find((k) => k.toLowerCase() === "authorization");
+  if (!authKey) return res;
+
+  renewing = renewing || renewAccessToken().finally(() => { renewing = null; });
+  const fresh = await renewing;
+  if (!fresh) return res;
+  headers[authKey] = `Bearer ${fresh}`;
+  return rawFetch(input, { ...init, headers });
+};
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
@@ -74,10 +119,19 @@ function MainTabs() {
 // ---------- App Root ----------
 export default function App() {
   const [ready, setReady] = useState(false);
+  const [initialRoute, setInitialRoute] = useState("Login");
 
   useEffect(() => {
     const prepare = async () => {
       await SplashScreen.preventAutoHideAsync();
+      // Skip the login screen if a session is already saved
+      try {
+        const [user, refreshToken] = await Promise.all([
+          AsyncStorage.getItem("user"),
+          AsyncStorage.getItem("refreshToken"),
+        ]);
+        if (user && refreshToken) setInitialRoute("Main");
+      } catch {}
       setReady(true);
       await SplashScreen.hideAsync();
     };
@@ -88,7 +142,7 @@ export default function App() {
 
   return (
     <NavigationContainer>
-      <Stack.Navigator screenOptions={{ headerShown: false }}>
+      <Stack.Navigator initialRouteName={initialRoute} screenOptions={{ headerShown: false }}>
         
         {/* Login First */}
         <Stack.Screen name="Login" component={LoginScreen} />

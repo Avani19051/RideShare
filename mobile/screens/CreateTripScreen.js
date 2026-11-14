@@ -133,7 +133,7 @@ export default function CreateTripScreen({ route, navigation }) {
 
       if(!resp || !resp.ok || !data?.ok){
         setLoading(false);
-        if(data?.error && String(data.error).toLowerCase().includes("auth")){
+        if(data?.error && /auth|token/.test(String(data.error).toLowerCase())){
           Alert.alert("Session expired","Please login again.");
           await AsyncStorage.multiRemove(["user","accessToken","refreshToken"]);
           navigation.reset({ index:0, routes:[{ name:"Login" }] });
